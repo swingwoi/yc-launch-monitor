@@ -1,7 +1,7 @@
 """
 YC Launch Monitor — Main orchestrator.
-Ties together directory scraping, social monitoring, state tracking,
-scheduling, and Slack alerting into a single polling loop.
+Ties together directory/speedrun monitoring, social monitoring, state
+tracking, scheduling, and Slack alerting into a single polling loop.
 """
 import time
 import logging
@@ -10,10 +10,11 @@ from datetime import datetime, timezone
 import config
 from state_store import JsonlStore, make_company_id
 from scheduler import Scheduler
-from sources.yc_directory import check_new_yc_companies
+from sources.yc_directory import get_new_yc_companies
+from sources.speedrun import get_new_speedrun_companies
 from sources.twitter_monitor import search_yc_posts, detect_early_founders
 from sources.linkedin_monitor import scrape_linkedin_hashtag, detect_yc_founders_linkedin
-from slack_transport import send_alert, format_alert
+from slack_transport import send_alert
 
 log = logging.getLogger("yc-monitor")
 
@@ -29,6 +30,10 @@ def _setup_logging():
     )
 
 
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
 class Monitor:
     """Main monitoring loop — polls sources, deduplicates, alerts via Slack."""
 
@@ -42,125 +47,146 @@ class Monitor:
             config.CHECK_INTERVAL_HOURS,
         )
 
-    # ── helpers ──────────────────────────────────────────────────────
-    def _known_slugs(self) -> set[str]:
-        """Collect all previously-seen YC company slugs from state."""
-        return {
-            rec["slug"]
-            for rec in self.store.all()
-            if rec.get("source") == "yc_directory" and "slug" in rec
-        }
-
-    def _known_social_ids(self) -> set[str]:
-        """Collect all previously-seen social post IDs from state."""
-        return {
-            rec.get("social_id", rec.get("tweet_id", rec.get("post_id", "")))
-            for rec in self.store.all()
-            if rec.get("source") in ("x", "linkedin") and rec.get("social_id")
-        }
-
-    def _alert_and_record(self, records: list[dict]):
-        """Send Slack alert and persist each record."""
-        for rec in records:
-            payload = format_alert(rec)
-            # Queue alert in the crash-safe scheduler
-            self.scheduler.enqueue({
-                "type": "slack_alert",
-                "record_id": rec["id"],
-                "payload": payload,
-            })
-            # Persist the detection record
+    # ── source checks ────────────────────────────────────────────────
+    def _check_yc_directory(self, now: str) -> list[dict]:
+        """Incremental YC new-listings from the yc-oss changes feed."""
+        seen = {r["slug"] for r in self.store.all()
+                if r.get("source") == "yc_directory" and "slug" in r}
+        out = []
+        for company in get_new_yc_companies(seen):
+            cid = make_company_id("yc_directory", company.slug)
+            if self.store.has("id", cid):
+                continue
+            rec = {
+                "id": cid, "source": "yc_directory", "detected_at": now,
+                "alert_type": "new_yc_company",
+                "company_name": company.name, "batch": company.batch,
+                "description": company.one_liner,
+                "url": company.url, "website": company.website,
+                "industry": company.industry, "team_size": company.extra.get("team_size", ""),
+                "stage": company.extra.get("stage", ""),
+                "slug": company.slug,
+            }
+            out.append(rec)
             self.store.append(rec)
-            log.info("Recorded %s (source=%s)", rec["id"], rec.get("source"))
+        return out
+
+    def _check_speedrun(self, now: str) -> list[dict]:
+        """New a16z Speedrun companies from the public API.
+
+        First run establishes a baseline: every existing slug is snapshotted
+        but nothing is alerted, so we never spam 250+ alerts on day one.
+        Subsequent runs alert only on newly-added slugs.
+        """
+        seen = {r["slug"] for r in self.store.all()
+                if r.get("source") == "speedrun" and "slug" in r}
+        first_run = not seen
+        out = []
+        for company in get_new_speedrun_companies(seen):
+            cid = make_company_id("speedrun", company.slug)
+            # On baseline (first) run, record the slug but alert nothing.
+            if first_run:
+                self.store.append({"id": cid, "source": "speedrun",
+                                   "slug": company.slug, "detected_at": now,
+                                   "name": company.name, "baseline": True})
+                continue
+            if self.store.has("id", cid):
+                continue
+            founders = company.founders or []
+            fname = founders[0].get("name", "") if founders else ""
+            rec = {
+                "id": cid, "source": "speedrun", "detected_at": now,
+                "alert_type": "new_speedrun_company",
+                "company_name": company.name, "batch": company.cohort,
+                "description": company.description or company.key_signal,
+                "url": company.url,
+                "website": company.website_url, "x_url": company.x_url,
+                "linkedin_url": company.linkedin_url, "cohort": company.cohort,
+                "founder_name": fname,
+                "slug": company.slug,
+            }
+            out.append(rec)
+            self.store.append(rec)
+        return out
+
+    def _check_twitter(self, now: str) -> list[dict]:
+        posts = search_yc_posts(config.TWITTER_BEARER_TOKEN)
+        early = detect_early_founders(posts, set())
+        out = []
+        for post in early:
+            cid = make_company_id("x", post.tweet_id)
+            if self.store.has("id", cid):
+                continue
+            rec = {
+                "id": cid, "source": "x", "detected_at": now,
+                "alert_type": "early_founder",
+                "company_name": "Unknown company", "batch": "",
+                "description": post.text[:400],
+                "url": post.url,
+                "founder_name": post.author_name, "founder_handle": post.author_handle,
+                "original_text": post.text,
+            }
+            out.append(rec)
+            self.store.append(rec)
+        return out
+
+    def _check_linkedin(self, now: str) -> list[dict]:
+        posts = scrape_linkedin_hashtag("ycombinator")
+        matches = detect_yc_founders_linkedin(posts, set())
+        out = []
+        for post in matches:
+            cid = make_company_id("linkedin", post.post_id)
+            if self.store.has("id", cid):
+                continue
+            rec = {
+                "id": cid, "source": "linkedin", "detected_at": now,
+                "alert_type": "early_founder",
+                "company_name": "Unknown company", "batch": "",
+                "description": post.text[:400],
+                "url": post.url,
+                "founder_name": post.author_name,
+                "original_text": post.text,
+            }
+            out.append(rec)
+            self.store.append(rec)
+        return out
 
     # ── main cycle ──────────────────────────────────────────────────
-    def run_cycle(self):
+    def run_cycle(self) -> list[dict]:
         """Execute one full monitoring pass across all sources."""
         log.info("=== Starting monitor cycle ===")
-        now = datetime.now(timezone.utc).isoformat()
+        now = _now()
         new_records: list[dict] = []
 
-        # 1. YC Directory — new companies
-        try:
-            seen_slugs = self._known_slugs()
-            new_companies = check_new_yc_companies(seen_slugs)
-            for company in new_companies:
-                cid = make_company_id("yc_directory", company.slug)
-                if not self.store.has("id", cid):
-                    rec = {
-                        "id": cid,
-                        "source": "yc_directory",
-                        "detected_at": now,
-                        **company.to_dict(),
-                    }
-                    new_records.append(rec)
-            log.info("YC directory: %d new companies", len(new_companies))
-        except Exception as exc:
-            log.error("YC directory check failed: %s", exc, exc_info=True)
+        for check in (self._check_yc_directory, self._check_speedrun,
+                      self._check_twitter, self._check_linkedin):
+            try:
+                new_records.extend(check(now))
+            except Exception as exc:
+                log.error("%s check failed: %s", check.__name__, exc, exc_info=True)
 
-        # 2. X / Twitter — early founder posts
-        try:
-            twitter_posts = search_yc_posts(config.TWITTER_BEARER_TOKEN)
-            known_social = self._known_social_ids()
-            early = detect_early_founders(twitter_posts, self._known_slugs())
-            for post in early:
-                cid = make_company_id("x", post.tweet_id)
-                if cid not in known_social and not self.store.has("id", cid):
-                    rec = {
-                        "id": cid,
-                        "source": "x",
-                        "social_id": post.tweet_id,
-                        "detected_at": now,
-                        **post.to_dict(),
-                    }
-                    new_records.append(rec)
-            log.info("X monitor: %d early founder posts", len(early))
-        except Exception as exc:
-            log.error("X monitor failed: %s", exc, exc_info=True)
+        # Queue + push alerts (scheduler gives crash-safe retry)
+        for rec in new_records:
+            self.scheduler.enqueue({"type": "slack_alert", "record": rec})
+        self._drain()
 
-        # 3. LinkedIn — YC hashtag posts
-        try:
-            li_posts = scrape_linkedin_hashtag("ycombinator")
-            known_social = self._known_social_ids()
-            matches = detect_yc_founders_linkedin(li_posts, self._known_slugs())
-            for post in matches:
-                cid = make_company_id("linkedin", post.post_id)
-                if cid not in known_social and not self.store.has("id", cid):
-                    rec = {
-                        "id": cid,
-                        "source": "linkedin",
-                        "social_id": post.post_id,
-                        "detected_at": now,
-                        **post.to_dict(),
-                    }
-                    new_records.append(rec)
-            log.info("LinkedIn: %d YC founder matches", len(matches))
-        except Exception as exc:
-            log.error("LinkedIn monitor failed: %s", exc, exc_info=True)
-
-        # 4. Persist + alert for all new detections
-        if new_records:
-            self._alert_and_record(new_records)
-            log.info("Cycle complete: %d new detections queued for Slack", len(new_records))
-        else:
-            log.info("Cycle complete: no new detections")
-
-        # 5. Drain any pending scheduler items (retry crashed alerts)
-        def _send_slack_alert(payload: dict) -> str:
-            send_alert(payload["payload"])
-            return f"sent:{payload['record_id']}"
-
-        drained = self.scheduler.drain(_send_slack_alert)
-        if drained:
-            log.info("Scheduler drained %d pending alerts", len(drained))
-
+        log.info("Cycle complete: %d new detections queued", len(new_records))
         return new_records
+
+    def _drain(self):
+        def _send(record_dict: dict) -> str:
+            rec = record_dict["record"]
+            send_alert(rec)  # transport builds blocks + retries internally
+            return f"sent:{rec['id']}"
+        drained = self.scheduler.drain(_send, max_attempts=3)
+        if drained:
+            log.info("Scheduler drained %d alert(s)", len(drained))
 
     # ── run loop ────────────────────────────────────────────────────
     def run_forever(self, interval_hours=None):
-        """Poll forever with a configurable interval."""
+        """Poll forever with a configurable interval (floor 60s)."""
         interval = interval_hours or config.CHECK_INTERVAL_HOURS
-        interval_sec = max(interval * 3600, 60)  # floor of 60s
+        interval_sec = max(interval * 3600, 60)
         log.info("Entering run_forever loop (interval=%.1fh)", interval)
 
         while True:
@@ -171,7 +197,6 @@ class Monitor:
                 break
             except Exception as exc:
                 log.error("Cycle raised unexpected error: %s", exc, exc_info=True)
-
             log.info("Sleeping %.0fs until next cycle…", interval_sec)
             try:
                 time.sleep(interval_sec)
@@ -186,16 +211,11 @@ if __name__ == "__main__":
 
     parser = argparse.ArgumentParser(description="YC Launch Monitor")
     parser.add_argument("--once", action="store_true", help="Run a single cycle and exit")
-    parser.add_argument(
-        "--interval",
-        type=float,
-        default=None,
-        help="Override check interval in hours",
-    )
+    parser.add_argument("--interval", type=float, default=None,
+                        help="Override check interval in hours")
     args = parser.parse_args()
 
     monitor = Monitor()
-
     if args.once:
         monitor.run_cycle()
     else:

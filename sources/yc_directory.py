@@ -1,14 +1,22 @@
 """
-YC Directory Scraper — detects new YC/Speedrun companies.
-Uses requests + HTML parsing with Inertia.js data-page extraction.
+YC Directory source — uses the public `yc-oss` GitHub Pages mirror
+of YC's Algolia index. It exposes an incremental `changes/latest.json`
+feed with an `added` array = newly listed companies. No API key, updates
+daily, works from pure Python.
+
+Endpoint (public, no key):
+    https://yc-oss.github.io/api/changes/latest.json
 """
 import json
-import re
 import logging
+from datetime import datetime, timezone
+
 import requests
-from typing import Optional
 
 log = logging.getLogger("yc-monitor")
+
+BASE = "https://yc-oss.github.io/api"
+CHANGES_URL = f"{BASE}/changes/latest.json"
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
@@ -17,106 +25,77 @@ HEADERS = {
 
 
 class YCCompany:
+    """A YC directory company / new-listing record."""
+
     def __init__(self, name: str, slug: str, batch: str = "",
-                 description: str = "", url: str = ""):
+                 one_liner: str = "", website: str = "",
+                 industry: str = "", launched_at: str = "",
+                 url: str = "", **extra):
         self.name = name
         self.slug = slug
         self.batch = batch
-        self.description = description
+        self.one_liner = one_liner
+        self.website = website
+        self.industry = industry
+        self.launched_at = launched_at
         self.url = url or f"https://www.ycombinator.com/companies/{slug}"
+        self.extra = extra
 
     def to_dict(self) -> dict:
-        return {
+        d = {
             "name": self.name,
             "slug": self.slug,
             "batch": self.batch,
-            "description": self.description,
+            "one_liner": self.one_liner,
+            "website": self.website,
+            "industry": self.industry,
+            "launched_at": self.launched_at,
             "url": self.url,
         }
+        d.update(self.extra)
+        return d
 
 
-def _parse_from_html(html: str) -> list[YCCompany]:
-    """Extract companies from YC HTML — links with /companies/<slug>."""
-    companies = []
-    seen = set()
-    for match in re.finditer(r'href="(/companies/([^/?"]+))"', html):
-        slug = match.group(2)
-        if slug in seen or len(slug) < 2:
-            continue
-        seen.add(slug)
-        companies.append(YCCompany(
-            name=slug.replace("-", " ").title(),
-            slug=slug,
-        ))
-    return companies
+def _parse_company(rec: dict) -> YCCompany:
+    return YCCompany(
+        name=rec.get("name", rec.get("slug", "")),
+        slug=rec.get("slug", ""),
+        batch=rec.get("batch", ""),
+        one_liner=rec.get("one_liner", ""),
+        website=rec.get("website", ""),
+        industry=rec.get("industry", ""),
+        launched_at=rec.get("launched_at", ""),
+        url=rec.get("url") or f"https://www.ycombinator.com/companies/{rec.get('slug','')}",
+        long_description=rec.get("long_description", "") or "",
+        team_size=rec.get("team_size", "") or "",
+        stage=rec.get("stage", "") or "",
+        regions=rec.get("regions", []) or [],
+        status=rec.get("status", "") or "",
+    )
 
 
-def _parse_from_data_page(html: str) -> list[YCCompany]:
-    """Extract from Inertia.js data-page attribute (server-rendered props)."""
-    companies = []
-    match = re.search(r'data-page="([^"]+)"', html)
-    if not match:
-        return companies
-    try:
-        import html as html_mod
-        raw = html_mod.unescape(match.group(1))
-        data = json.loads(raw)
-        props = data.get("props", {})
-        # Companies might be nested in various places
-        for key in ("companies", "results", "data"):
-            items = props.get(key, [])
-            if isinstance(items, list) and items:
-                for item in items:
-                    if isinstance(item, dict):
-                        slug = item.get("slug", "")
-                        if slug:
-                            companies.append(YCCompany(
-                                name=item.get("name", slug),
-                                slug=slug,
-                                batch=item.get("batch", ""),
-                                description=item.get("one_liner",
-                                                    item.get("description", "")),
-                            ))
-                break
-    except (json.JSONDecodeError, TypeError):
-        pass
-    return companies
+def fetch_changes() -> dict:
+    """Fetch the incremental changes feed. Raises on error."""
+    resp = requests.get(CHANGES_URL, headers=HEADERS, timeout=30)
+    resp.raise_for_status()
+    return resp.json()
 
 
-def scrape_yc_directory(url: str = "https://www.ycombinator.com/companies",
-                        batch_filter: str = "") -> list[YCCompany]:
-    """Scrape YC company directory. Returns list of YCCompany."""
-    companies = []
-    try:
-        resp = requests.get(url, headers=HEADERS, timeout=30)
-        resp.raise_for_status()
-        html = resp.text
+def get_new_yc_companies(seen_slugs: set[str]) -> list[YCCompany]:
+    """Return YC companies newly listed, minus those already seen.
 
-        # Try Inertia data-page first
-        companies = _parse_from_data_page(html)
-        if companies:
-            log.info("Parsed %d companies from data-page", len(companies))
-        else:
-            # Fallback: extract from HTML links
-            companies = _parse_from_html(html)
-            log.info("Extracted %d companies from HTML links", len(companies))
-
-        # Apply batch filter if specified
-        if batch_filter:
-            companies = [c for c in companies
-                         if batch_filter.lower() in c.batch.lower()
-                         or batch_filter.lower() in c.name.lower()]
-
-    except Exception as e:
-        log.error("YC directory scrape failed: %s", e)
-    return companies
-
-
-def check_new_yc_companies(seen_slugs: set[str],
-                           batch_filter: str = "") -> list[YCCompany]:
-    """Compare live directory against known slugs. Returns only new ones."""
-    all_companies = scrape_yc_directory(batch_filter=batch_filter)
-    new = [c for c in all_companies if c.slug not in seen_slugs]
-    log.info("YC check: %d total, %d new (filter=%r)",
-             len(all_companies), len(new), batch_filter)
+    Reads the mirror's incremental `added` array and filters against the
+    caller's seen set so nothing is alerted twice.
+    """
+    data = fetch_changes()
+    added = data.get("added", [])
+    log.info("YC changes feed: added=%d current_total=%s (generated %s)",
+             len(added), data.get("summary", {}).get("current_total"),
+             data.get("generated_at"))
+    new = []
+    for rec in added:
+        slug = rec.get("slug", "")
+        if slug and slug not in seen_slugs:
+            new.append(_parse_company(rec))
+    log.info("YC new (after dedup): %d", len(new))
     return new

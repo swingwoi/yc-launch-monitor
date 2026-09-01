@@ -19,6 +19,7 @@ SOURCE_LABELS = {
     "linkedin": "LinkedIn",
     "yc_directory": "YC Directory",
     "yc_speedrun": "YC Speedrun",
+    "speedrun": "a16z Speedrun",
 }
 
 
@@ -33,10 +34,17 @@ def _fmt_time(ts: str) -> str:
 def format_alert(alert: dict) -> list:
     """Format alert dict into Slack Block Kit JSON blocks.
 
+    Includes a *value summary* (what the target does + why it is worth an
+    early contact) and *source cross-reference* (labelled links to every
+    confirming source — YC profile, website, X, LinkedIn, GitHub) so the
+    reader can verify the signal across multiple origins.
+
     Args:
         alert: dict with keys: alert_type, company_name, source, batch,
                description, url, detected_at, founder_name, founder_handle,
-               original_text
+               original_text, plus optional enrichment: one_liner,
+               industry, team_size, website, x_url, linkedin_url, cohort,
+               stage, value_summary.
     Returns:
         List of Slack Block Kit blocks.
     """
@@ -44,18 +52,51 @@ def format_alert(alert: dict) -> list:
     company = alert.get("company_name", "Unknown Company")
     source = alert.get("source", "unknown")
     batch = alert.get("batch", "N/A")
-    description = alert.get("description", "")
+    description = (alert.get("description") or alert.get("one_liner") or "").strip()
     url = alert.get("url", "")
     founder_name = alert.get("founder_name", "")
     founder_handle = alert.get("founder_handle", "")
     original_text = alert.get("original_text", "")
+    # enrichment
+    industry = alert.get("industry", "")
+    team_size = alert.get("team_size", "")
+    website = alert.get("website", "")
+    x_url = alert.get("x_url", "")
+    linkedin_url = alert.get("linkedin_url", "")
+    github_url = alert.get("github_url", "")
+    cohort = alert.get("cohort", "")
+    stage = alert.get("stage", "")
 
     if atype == "early_founder":
-        emoji, title, status = "\U0001f525", "Early Founder Detected", "Pre-launch signal"
+        emoji, title, status = "\U0001f525", "Early YC Signal", "⚡ Founder announced / not yet official"
     elif atype == "new_yc_company":
-        emoji, title, status = "\u2705", "New YC Company Confirmed", "Confirmed in YC directory"
+        emoji, title, status = "\u2705", "New YC Company", "✅ Confirmed in YC directory"
+    elif atype == "new_speedrun_company":
+        emoji, title, status = "\U0001f680", "New a16z Speedrun Company", "✅ Confirmed in Speedrun program"
     else:
         emoji, title, status = "\U0001f6a8", "YC Monitor Alert", "Unknown"
+
+    # ---- value summary ----
+    summary_parts = []
+    if founder_name:
+        summary_parts.append(f"*{founder_name}*" + (f" (`@{founder_handle}`)" if founder_handle else ""))
+    if description:
+        summary_parts.append(description[:400])
+    # end-to-end line: what + why early
+    if industry:
+        summary_parts.append(f"Industry: *{industry}*")
+    if team_size:
+        summary_parts.append(f"Team: *{team_size}*")
+    if stage:
+        summary_parts.append(f"Stage: *{stage}*")
+    if cohort:
+        summary_parts.append(f"Cohort: *{cohort}*")
+    if batch and batch != "N/A":
+        summary_parts.append(f"Batch: *{batch}*")
+    if summary_parts:
+        summary = ("\n".join(summary_parts))[:2000]
+    else:
+        summary = description or "—"
 
     fields = [
         {"type": "mrkdwn", "text": f"*Company:*\n{company}"},
@@ -63,11 +104,10 @@ def format_alert(alert: dict) -> list:
         {"type": "mrkdwn", "text": f"*Source:*\n{SOURCE_LABELS.get(source, source)}"},
         {"type": "mrkdwn", "text": f"*Status:*\n{status}"},
     ]
-    if founder_name or founder_handle:
-        ftxt = founder_name
-        if founder_handle:
-            ftxt += f" ({founder_handle})"
-        fields.append({"type": "mrkdwn", "text": f"*Founder:*\n{ftxt}"})
+    if team_size:
+        fields.append({"type": "mrkdwn", "text": f"*Team size:*\n{team_size}"})
+    if industry:
+        fields.append({"type": "mrkdwn", "text": f"*Industry:*\n{industry}"})
 
     blocks = [
         {"type": "header", "text": {"type": "plain_text", "text": f"{emoji} {title}", "emoji": True}},
@@ -75,19 +115,31 @@ def format_alert(alert: dict) -> list:
         {"type": "section", "fields": fields},
     ]
 
-    if description:
-        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": f"*Description:*\n{description[:2000]}"}})
+    # Value summary (why it's worth an early contact)
+    blocks.append({"type": "section", "text": {
+        "type": "mrkdwn", "text": f"*What they do — why it matters:*\n{summary}"
+    }})
 
     if original_text:
         blocks.append({"type": "context", "elements": [
-            {"type": "mrkdwn", "text": f"*Original text:* _{original_text[:500]}_"}
+            {"type": "mrkdwn", "text": f"*Original post:* _{original_text[:500]}_"}
         ]})
 
+    # Source cross-reference: labelled links to every confirming origin
+    ref_links = []
     if url:
-        aid = f"view_{company.replace(' ', '_').lower()}"
-        blocks.append({"type": "actions", "elements": [
-            {"type": "button", "text": {"type": "plain_text", "text": "\U0001f517 View Source", "emoji": True},
-             "url": url, "action_id": aid}
+        ref_links.append(f"<{url}|🗂 YC/Program page>")
+    if website:
+        ref_links.append(f"<{website}|🌐 Website>")
+    if x_url:
+        ref_links.append(f"<{x_url}|🐦 X profile>")
+    if linkedin_url:
+        ref_links.append(f"<{linkedin_url}|💼 LinkedIn>")
+    if github_url:
+        ref_links.append(f"<{github_url}|⚙️ GitHub>")
+    if ref_links:
+        blocks.append({"type": "context", "elements": [
+            {"type": "mrkdwn", "text": f"*Source cross-ref:* {'  ·  '.join(ref_links[:6])}"}
         ]})
 
     detected_str = _fmt_time(alert.get("detected_at", ""))
