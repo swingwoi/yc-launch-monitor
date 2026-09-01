@@ -1,0 +1,12 @@
+.env
+state.jsonl
+state.jsonl.tmp
+__pycache__/
+*.pyc
+.pytest_cache/
+dist/
+*.egg-info/
+.venv/
+venv/
+node_modules/
+*.db
