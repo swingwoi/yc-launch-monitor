@@ -163,13 +163,30 @@ python run.py --interval 4
 
 | Module | Purpose |
 |--------|---------|
-| `run.py` | Entry point: CLI, Monitor class, Slack transport, shutdown handling |
+| `run.py` | Entry point: CLI parsing, `--once`/`--test-slack`/`--status`, graceful shutdown |
 | `config.py` | Loads `.env`, validates required vars, exports typed constants |
-| `sources/yc_directory.py` | Scrapes the YC company directory (React `__NEXT_DATA__` + HTML fallback) |
-| `sources/twitter_monitor.py` | Searches X/Twitter API v2 for YC founder launch posts |
-| `sources/linkedin_monitor.py` | Scrapes LinkedIn hashtag feeds for YC founder announcements |
-| `state_store.py` | Crash-safe append-only JSONL store with file-locking |
+| `monitor.py` | Orchestrator: polls all sources → dedups → sends enriched Slack alerts |
+| `sources/yc_directory.py` | New YC listings via the public `yc-oss` change feed (no API key) |
+| `sources/speedrun.py` | a16z Speedrun companies via public REST API (no API key, baseline on first run) |
+| `sources/targeting.py` | Builds a deep per-alert targeting brief (category, ICP relevance, outreach angle) |
+| `sources/twitter_monitor.py` | X/Twitter founder posts — API v2 or pluggable keyword monitor |
+| `sources/linkedin_monitor.py` | LinkedIn founder posts — pluggable public scraper adapter |
+| `slack_transport.py` | Slack Block Kit payloads (value summary + source cross-reference) + send with retries |
+| `state_store.py` | Crash-safe append-only JSONL store with file-locking (dedup) |
 | `scheduler.py` | Persistent task queue with at-least-once delivery (crash recovery) |
+
+## Data sources: what works with no keys
+
+| Source | Method | Needs a key? |
+|--------|--------|--------------|
+| YC Directory | `yc-oss` GitHub Pages change feed (`changes/latest.json`) | **No** |
+| a16z Speedrun | public REST API `speedrun-api.a16z.com` | **No** |
+| X / Twitter | official API v2, or any third-party keyword monitor via pluggable adapter | **Yes / optional** |
+| LinkedIn | pluggable adapter to a public scraper (e.g. Apify no-cookie) | **Yes / optional** |
+
+YC Directory + Speedrun work out of the box, so the bot is fully functional
+before you add any API keys. X/LinkedIn are gracefully skipped until
+configured.
 
 ## Usage Examples
 
