@@ -1,11 +1,14 @@
-"""Slack Bot transport for YC Launch Monitor alerts."""
-
+"""
+Slack Bot transport for YC Launch Monitor alerts.
+"""
 import os
 import time
 import logging
 from datetime import datetime
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
+
+from sources.targeting import build_targeting_brief
 
 logger = logging.getLogger(__name__)
 
@@ -76,27 +79,21 @@ def format_alert(alert: dict) -> list:
     else:
         emoji, title, status = "\U0001f6a8", "YC Monitor Alert", "Unknown"
 
-    # ---- value summary ----
-    summary_parts = []
-    if founder_name:
-        summary_parts.append(f"*{founder_name}*" + (f" (`@{founder_handle}`)" if founder_handle else ""))
-    if description:
-        summary_parts.append(description[:400])
-    # end-to-end line: what + why early
-    if industry:
-        summary_parts.append(f"Industry: *{industry}*")
-    if team_size:
-        summary_parts.append(f"Team: *{team_size}*")
-    if stage:
-        summary_parts.append(f"Stage: *{stage}*")
-    if cohort:
-        summary_parts.append(f"Cohort: *{cohort}*")
-    if batch and batch != "N/A":
-        summary_parts.append(f"Batch: *{batch}*")
-    if summary_parts:
-        summary = ("\n".join(summary_parts))[:2000]
-    else:
-        summary = description or "—"
+    # ---- deep targeting brief ----
+    # Build a structured, buyer-useful summary from the fields we have.
+    brief = build_targeting_brief(alert, source)
+    brief_lines = []
+    if brief["what"]:
+        brief_lines.append(f"*What:* {brief['what'][:220]}")
+    brief_lines.append(f"*Category:* {brief['category']}")
+    brief_lines.append(f"*Signal:* {brief['signal']}")
+    brief_lines.append(f"*Timing:* {brief['timing']}")
+    brief_lines.append(f"*Relevance for this buyer:* {brief['relevance_label']}")
+    if brief["founder"]:
+        brief_lines.append(f"*Founder:* {brief['founder']}")
+    brief_lines.append(f"*Suggested angle:* {brief['angle'][:260]}")
+    brief_lines.append(f"*Confidence:* {brief['confidence']}")
+    brief_text = "\n".join(brief_lines)
 
     fields = [
         {"type": "mrkdwn", "text": f"*Company:*\n{company}"},
@@ -115,9 +112,9 @@ def format_alert(alert: dict) -> list:
         {"type": "section", "fields": fields},
     ]
 
-    # Value summary (why it's worth an early contact)
+    # Deep targeting brief (value summary + buyer fit + angle)
     blocks.append({"type": "section", "text": {
-        "type": "mrkdwn", "text": f"*What they do — why it matters:*\n{summary}"
+        "type": "mrkdwn", "text": f"*🎯 Targeting brief:*\n{brief_text}"
     }})
 
     if original_text:
